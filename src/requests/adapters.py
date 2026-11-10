@@ -34,8 +34,8 @@ from urllib3.util import parse_url
 from urllib3.util.retry import Retry
 
 from .auth import _basic_auth_str
-from .compat import basestring, urlparse
-from .cookies import extract_cookies_to_jar
+from .compat import basestring, cookielib, urlparse
+from .cookies import _get_jar_policy, extract_cookies_to_jar
 from .exceptions import (
     ConnectionError,
     ConnectTimeout,
@@ -391,7 +391,10 @@ class HTTPAdapter(BaseAdapter):
         else:
             response.url = req.url
 
-        # Add new cookies from the server.
+        # Add new cookies from the server, honoring the cookie policy
+        # (e.g. StrictCookiePrefixPolicy) carried by the request's jar.
+        if isinstance(req._cookies, cookielib.CookieJar):
+            response.cookies.set_policy(_get_jar_policy(req._cookies))
         extract_cookies_to_jar(response.cookies, req, resp)
 
         # Give the Response some context.

@@ -5,6 +5,12 @@ dev
 ---
 
 - \[Short description of non-trivial change.\]
+- Added `requests.cookies.StrictCookiePrefixPolicy`, an opt-in cookie policy
+  enforcing the `__Secure-`/`__Host-` prefix rules (RFC 6265bis) for cookies
+  received from a server. Enable it with
+  `session.cookies.set_policy(StrictCookiePrefixPolicy())`. The policy is
+  honored across redirects and session cookie persistence, and does not
+  restrict cookies callers place into a jar directly.
 
 
 2.34.2 (2026-05-14)

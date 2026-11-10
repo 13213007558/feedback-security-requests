@@ -10,10 +10,13 @@ import re
 import tempfile
 import threading
 import warnings
+from email.message import Message
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 import urllib3
+from urllib3 import HTTPHeaderDict, HTTPResponse
 from urllib3.util import Timeout as Urllib3Timeout
 
 import requests
@@ -29,7 +32,11 @@ from requests.compat import (
     is_urllib3_1,
     urlparse,
 )
-from requests.cookies import cookiejar_from_dict, morsel_to_cookie
+from requests.cookies import (
+    StrictCookiePrefixPolicy,
+    cookiejar_from_dict,
+    morsel_to_cookie,
+)
 from requests.exceptions import (
     ChunkedEncodingError,
     ConnectionError,
@@ -2531,6 +2538,220 @@ class TestMorselToCookieMaxAge:
         morsel["max-age"] = "woops"
         with pytest.raises(TypeError):
             morsel_to_cookie(morsel)
+
+
+def _raw_response(set_cookies=(), status=200, location=None):
+    """Build a urllib3 response carrying the given Set-Cookie headers."""
+    headers = HTTPHeaderDict()
+    for header in set_cookies:
+        headers.add("Set-Cookie", header)
+    if location is not None:
+        headers.add("Location", location)
+    raw = HTTPResponse(
+        body=io.BytesIO(b""),
+        status=status,
+        headers=headers,
+        preload_content=True,
+        reason="OK",
+    )
+    # extract_cookies_to_jar reads the original httplib message.
+    msg = Message()
+    for header in set_cookies:
+        msg.add_header("Set-Cookie", header)
+    raw._original_response = SimpleNamespace(msg=msg, isclosed=lambda: True)
+    return raw
+
+
+class _StubAdapter(HTTPAdapter):
+    """Answers with canned responses and records the PreparedRequests sent."""
+
+    def __init__(self, raws):
+        super().__init__()
+        self._raws = list(raws)
+        self.requests = []
+
+    def send(self, request, **kwargs):
+        self.requests.append(request)
+        return self.build_response(request, self._raws.pop(0))
+
+
+class TestStrictCookiePrefixPolicy:
+    """Tests for the opt-in __Secure-/__Host- receive policy.
+
+    All assertions about what gets sent are based on the Cookie header of
+    the PreparedRequest the library actually emits (captured by the stub
+    adapter), not on any browser behavior.
+    """
+
+    def _session(self, raws, strict=True):
+        session = requests.Session()
+        if strict:
+            session.cookies.set_policy(StrictCookiePrefixPolicy())
+        adapter = _StubAdapter(raws)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        return session, adapter
+
+    def test_secure_prefix_rejected_over_http_but_other_cookies_kept(self):
+        session, adapter = self._session(
+            [
+                _raw_response(
+                    (
+                        "__Secure-token=abc; Secure; Path=/",
+                        "plain=1; Path=/",
+                    )
+                ),
+                _raw_response(),
+            ]
+        )
+        r1 = session.get("http://example.com/")
+        # The rejected cookie is dropped without affecting the valid one
+        # from the same response.
+        assert "__Secure-token" not in session.cookies
+        assert "__Secure-token" not in r1.cookies
+        assert session.cookies.get("plain") == "1"
+        assert r1.cookies.get("plain") == "1"
+        session.get("http://example.com/")
+        sent = adapter.requests[1].headers.get("Cookie", "")
+        assert "__Secure-token" not in sent
+        assert "plain=1" in sent
+
+    def test_secure_prefix_requires_secure_attribute_over_https(self):
+        session, adapter = self._session(
+            [
+                _raw_response(
+                    (
+                        "__Secure-nosec=1; Path=/",
+                        "__Secure-good=2; Secure; Path=/",
+                    )
+                ),
+                _raw_response(),
+            ]
+        )
+        session.get("https://example.com/")
+        session.get("https://example.com/")
+        sent = adapter.requests[1].headers.get("Cookie", "")
+        assert "__Secure-good=2" in sent
+        assert "__Secure-nosec" not in sent
+
+    def test_host_prefix_rules_over_https(self):
+        session, adapter = self._session(
+            [
+                _raw_response(
+                    (
+                        "__Host-good=1; Secure; Path=/",
+                        "__Host-subpath=2; Secure; Path=/sub",
+                        "__Host-nopath=3; Secure",
+                        "__Host-nosecure=4; Path=/",
+                    )
+                ),
+                _raw_response(),
+            ]
+        )
+        session.get("https://example.com/")
+        session.get("https://example.com/")
+        sent = adapter.requests[1].headers.get("Cookie", "")
+        assert sent == "__Host-good=1"
+
+    def test_host_prefix_rejects_explicit_default_domain(self):
+        # Domain=example.com matches the origin host, so the default policy
+        # would accept it; the strict policy must still refuse it.
+        session, adapter = self._session(
+            [
+                _raw_response(
+                    (
+                        "__Host-explicit=1; Secure; Path=/; Domain=example.com",
+                        "__Host-ok=2; Secure; Path=/",
+                    )
+                ),
+                _raw_response(),
+            ]
+        )
+        session.get("https://example.com/")
+        session.get("https://example.com/")
+        sent = adapter.requests[1].headers.get("Cookie", "")
+        assert sent == "__Host-ok=2"
+
+    def test_host_prefix_same_name_different_paths(self):
+        session, adapter = self._session(
+            [
+                _raw_response(
+                    (
+                        "__Host-dup=root; Secure; Path=/",
+                        "__Host-dup=sub; Secure; Path=/sub",
+                    )
+                ),
+                _raw_response(),
+            ]
+        )
+        session.get("https://example.com/")
+        session.get("https://example.com/sub/page")
+        sent = adapter.requests[1].headers.get("Cookie", "")
+        assert sent == "__Host-dup=root"
+
+    def test_rejected_cookie_not_resurrected_on_http_to_https_redirect(self):
+        session, adapter = self._session(
+            [
+                _raw_response(
+                    (
+                        "__Host-redir=bad; Secure; Path=/",
+                        "plain=1; Path=/",
+                    ),
+                    status=302,
+                    location="https://example.com/final",
+                ),
+                _raw_response(("__Host-final=ok; Secure; Path=/",)),
+            ]
+        )
+        session.get("http://example.com/start")
+        # The cookie rejected on the insecure http hop must not reappear on
+        # the https redirect target nor in the session jar.
+        sent = adapter.requests[1].headers.get("Cookie", "")
+        assert "__Host-redir" not in sent
+        assert "plain=1" in sent
+        assert "__Host-redir" not in session.cookies
+        assert session.cookies.get("__Host-final") == "ok"
+        assert session.cookies.get("plain") == "1"
+
+    def test_forged_host_header_cannot_impersonate_secure_origin(self):
+        session, adapter = self._session(
+            [
+                _raw_response(
+                    (
+                        "__Secure-a=1; Secure; Path=/",
+                        "__Host-b=2; Secure; Path=/",
+                    )
+                ),
+                _raw_response(),
+            ]
+        )
+        # The Host header is caller-controlled; the secure-origin check must
+        # be based on the URL the connection actually accessed (http here).
+        session.get("http://example.com/", headers={"Host": "secure.example.com"})
+        session.get("http://example.com/")
+        sent = adapter.requests[1].headers.get("Cookie", "")
+        assert "__Secure-a" not in sent
+        assert "__Host-b" not in sent
+        assert "__Secure-a" not in session.cookies
+        assert "__Host-b" not in session.cookies
+
+    def test_direct_jar_writes_are_not_subject_to_the_policy(self):
+        # The strict policy gates cookies received from a server; values the
+        # caller places into the jar directly keep their existing behavior.
+        session, adapter = self._session([_raw_response()])
+        session.cookies.set("__Host-manual", "1")
+        session.get("http://example.com/")
+        sent = adapter.requests[0].headers.get("Cookie", "")
+        assert "__Host-manual=1" in sent
+
+    def test_prefixes_not_enforced_without_opt_in(self):
+        session, adapter = self._session(
+            [_raw_response(("__Host-lax=1",)), _raw_response()], strict=False
+        )
+        session.get("http://example.com/")
+        session.get("http://example.com/")
+        sent = adapter.requests[1].headers.get("Cookie", "")
+        assert "__Host-lax=1" in sent
 
 
 class TestTimeout:

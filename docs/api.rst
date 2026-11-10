@@ -100,6 +100,9 @@ Cookies
 .. autoclass:: requests.cookies.RequestsCookieJar
    :inherited-members:
 
+.. autoclass:: requests.cookies.StrictCookiePrefixPolicy
+   :inherited-members:
+
 .. autoclass:: requests.cookies.CookieConflictError
    :inherited-members:
 

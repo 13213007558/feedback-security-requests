@@ -23,6 +23,7 @@ from .auth import _basic_auth_str
 from .compat import cookielib, urljoin, urlparse
 from .cookies import (
     RequestsCookieJar,
+    _get_jar_policy,
     cookiejar_from_dict,
     extract_cookies_to_jar,
     merge_cookies,
@@ -531,6 +532,10 @@ class Session(SessionRedirectMixin):
         merged_cookies = merge_cookies(
             merge_cookies(RequestsCookieJar(), self.cookies), cookies
         )
+        # Carry the session jar's policy (e.g. StrictCookiePrefixPolicy) over
+        # to the merged jar, so it also applies to cookies received from the
+        # server while resolving redirects.
+        merged_cookies.set_policy(_get_jar_policy(self.cookies))
 
         # Set environment's basic authentication if not explicitly set.
         auth = request.auth

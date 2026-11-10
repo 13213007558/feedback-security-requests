@@ -64,6 +64,25 @@ If you want to manually add cookies to your session, use the
 :ref:`Cookie utility functions <api-cookies>` to manipulate
 :attr:`Session.cookies <requests.Session.cookies>`.
 
+If the server relies on the ``__Secure-`` and ``__Host-`` cookie name
+prefixes (RFC 6265bis) to protect login cookies, you can opt into strict
+enforcement of their rules for cookies received from a server::
+
+    from requests.cookies import StrictCookiePrefixPolicy
+
+    s = requests.Session()
+    s.cookies.set_policy(StrictCookiePrefixPolicy())
+
+With this policy, a ``__Secure-`` cookie is only accepted over HTTPS and
+with the ``Secure`` attribute, and a ``__Host-`` cookie must additionally
+use ``Path=/`` and carry no ``Domain`` attribute. The secure-origin check is
+based on the URL of the connection, so a caller-supplied ``Host`` header
+cannot impersonate a secure origin. Cookies that fail the checks are refused
+individually, without affecting other cookies in the same response. The
+policy only applies to cookies received from a server; cookies you place
+into the jar yourself (e.g. via ``set()`` or ``cookiejar_from_dict()``) are
+left alone.
+
 Sessions can also be used as context managers::
 
     with requests.Session() as s:

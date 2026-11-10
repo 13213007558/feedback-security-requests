@@ -13,7 +13,12 @@ import calendar
 import copy
 import time
 from collections.abc import Iterator, MutableMapping
-from http.cookiejar import Cookie, CookieJar, CookiePolicy
+from http.cookiejar import (
+    Cookie,
+    CookieJar,
+    CookiePolicy,
+    DefaultCookiePolicy,
+)
 from typing import TYPE_CHECKING, Any, TypeVar, overload
 
 from ._internal_utils import to_native_string
@@ -186,6 +191,61 @@ class CookieConflictError(RuntimeError):
     """There are two cookies that meet the criteria specified in the cookie jar.
     Use .get and .set and include domain and path args in order to be more specific.
     """
+
+
+_SECURE_COOKIE_PREFIX = "__secure-"
+_HOST_COOKIE_PREFIX = "__host-"
+
+
+class StrictCookiePrefixPolicy(DefaultCookiePolicy):
+    """A cookie policy enforcing the ``__Secure-`` and ``__Host-`` name
+    prefix rules (RFC 6265bis) for cookies received from a server.
+
+    Opt in by attaching this policy to the session's cookie jar::
+
+        session.cookies.set_policy(StrictCookiePrefixPolicy())
+
+    The policy is only consulted when cookies are extracted from a server
+    response (``Set-Cookie`` headers). Cookies a caller places into a jar
+    directly (via ``set()``, ``set_cookie()``, ``cookiejar_from_dict()`` or
+    ``merge_cookies()``) are not subject to these checks.
+
+    The secure-origin check uses the scheme of the URL the connection
+    actually accessed; a caller-supplied ``Host`` header cannot be used to
+    impersonate a secure origin. Cookies that fail the checks are refused
+    individually, without affecting other cookies in the same response.
+    """
+
+    def set_ok(self, cookie: Cookie, request: Any) -> bool:
+        if not super().set_ok(cookie, request):
+            return False
+
+        name = cookie.name.lower()
+        if not name.startswith((_SECURE_COOKIE_PREFIX, _HOST_COOKIE_PREFIX)):
+            return True
+
+        # Both prefixes require a secure origin and the Secure attribute.
+        if not (cookie.secure and request.get_type() == "https"):
+            return False
+
+        if name.startswith(_HOST_COOKIE_PREFIX):
+            # __Host- additionally forbids a Domain attribute (even one
+            # matching the origin host) and requires an explicit Path=/.
+            if cookie.domain_specified:
+                return False
+            if not cookie.path_specified or cookie.path != "/":
+                return False
+
+        return True
+
+
+def _get_jar_policy(jar: CookieJar) -> CookiePolicy:  # type: ignore[reportUnusedFunction]  # cross-module usage in sessions.py and adapters.py
+    """Return the CookiePolicy attached to any CookieJar instance."""
+    get_policy = getattr(jar, "get_policy", None)
+    if callable(get_policy):
+        policy: CookiePolicy = get_policy()
+        return policy
+    return getattr(jar, "_policy", DefaultCookiePolicy())
 
 
 class RequestsCookieJar(CookieJar, MutableMapping[str, str | None]):  # type: ignore[misc]
