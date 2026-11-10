@@ -61,9 +61,11 @@ if TYPE_CHECKING:
         TypeIs,  # TODO: move to typing when Python >= 3.13
     )
 
+    from ._internal_utils import _Unset
     from .auth import AuthBase
     from .cookies import RequestsCookieJar
     from .models import PreparedRequest, Response
+    from .sessions import NetrcAuthPolicy
     from .structures import CaseInsensitiveDict
 
     class _ValidatedRequest(PreparedRequest):
@@ -137,6 +139,8 @@ if TYPE_CHECKING:
         tuple[str, str] | AuthBase | Callable[[PreparedRequest], PreparedRequest] | None
     )
 
+    NetrcAuthPolicyType: TypeAlias = NetrcAuthPolicy | bool | None | _Unset
+
     TimeoutType: TypeAlias = float | tuple[float | None, float | None] | None
     ProxiesType: TypeAlias = MutableMapping[str, str]
     HooksType: TypeAlias = dict[str, list[HookType]] | None
@@ -166,6 +170,7 @@ if TYPE_CHECKING:
         stream: bool | None
         verify: VerifyType | None
         cert: CertType
+        netrc_auth_policy: NetrcAuthPolicyType
 
     class RequestKwargs(BaseRequestKwargs, total=False):
         """kwargs for request(), options(), head(), delete()."""

@@ -12,11 +12,11 @@ import os
 import sys
 import time
 from collections import OrderedDict
-from collections.abc import Generator, Mapping, MutableMapping
+from collections.abc import Collection, Generator, Mapping, MutableMapping
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, cast
 
-from ._internal_utils import to_native_string
+from ._internal_utils import UNSET, _Unset, to_native_string
 from ._types import is_prepared as _is_prepared
 from .adapters import HTTPAdapter
 from .auth import _basic_auth_str
@@ -124,9 +124,80 @@ def merge_hooks(
     return merge_setting(request_hooks, session_hooks, dict_class)
 
 
+class NetrcAuthPolicy:
+    """Decides which request origins may receive credentials from netrc.
+
+    The policy is consulted for every request, including each request rebuilt
+    while following redirects. It only governs automatic credential lookup
+    through :func:`requests.utils.get_netrc_auth`; proxy and CA bundle settings
+    read from the environment continue to be controlled by
+    :attr:`Session.trust_env` and are unaffected by this policy.
+
+    Subclass and override :meth:`is_allowed` (or ``__call__``) to implement
+    custom admission rules. When the policy denies an origin, no netrc file is
+    opened and no credential lookup takes place.
+    """
+
+    def is_allowed(self, url: str) -> bool:
+        """Return ``True`` if netrc credentials may be looked up for *url*.
+
+        The default policy allows every origin. Override this method to
+        restrict which origins are eligible.
+        """
+        return True
+
+    def __call__(self, url: str) -> bool:
+        return self.is_allowed(url)
+
+
+class DenyAllNetrcAuth(NetrcAuthPolicy):
+    """Policy that never permits automatic netrc credentials."""
+
+    def is_allowed(self, url: str) -> bool:
+        return False
+
+
+class AllowedHostsNetrcAuth(NetrcAuthPolicy):
+    """Policy that permits automatic netrc credentials only for named hosts.
+
+    :param allowed_hosts: hostnames (lowercase) eligible for netrc lookup.
+        A request whose hostname is not listed is denied without opening the
+        netrc file.
+    """
+
+    def __init__(self, allowed_hosts: Collection[str]) -> None:
+        self.allowed_hosts = frozenset(host.lower() for host in allowed_hosts)
+
+    def is_allowed(self, url: str) -> bool:
+        hostname = urlparse(url).hostname
+        return hostname is not None and hostname.lower() in self.allowed_hosts
+
+
+#: Shared policy that disables automatic netrc credentials entirely.
+NETRC_AUTH_DISABLED = DenyAllNetrcAuth()
+
+
+def _coerce_netrc_auth_policy(
+    setting: _t.NetrcAuthPolicyType,
+) -> NetrcAuthPolicy:
+    """Normalize a ``netrc_auth_policy`` setting into a policy object.
+
+    ``True`` or ``None`` select the permissive default, ``False`` selects the
+    shared deny-all policy, and an existing :class:`NetrcAuthPolicy` is
+    returned unchanged. The :data:`~requests._internal_utils.UNSET` sentinel
+    (meaning "no per-request override") is handled by the caller, not here.
+    """
+    if isinstance(setting, NetrcAuthPolicy):
+        return setting
+    if setting is False:
+        return NETRC_AUTH_DISABLED
+    return NetrcAuthPolicy()
+
+
 class SessionRedirectMixin:
     max_redirects: int
     trust_env: bool
+    netrc_auth_policy: NetrcAuthPolicy | None
     cookies: RequestsCookieJar
 
     def send(self, request: PreparedRequest, **kwargs: Any) -> Response: ...
@@ -326,10 +397,62 @@ class SessionRedirectMixin:
             # authentication headers.
             del headers["Authorization"]
 
-        # .netrc might have more auth for us on our new host.
-        new_auth = get_netrc_auth(url) if self.trust_env else None
+        # .netrc might have more auth for us on our new host. The admission
+        # policy (not trust_env) decides whether the lookup is permitted, and a
+        # denied origin never opens the netrc file.
+        new_auth = self._get_netrc_auth(prepared_request)
         if new_auth is not None:
             prepared_request.prepare_auth(new_auth)
+
+    def _resolve_netrc_auth_policy(
+        self,
+        request_policy: _t.NetrcAuthPolicyType,
+    ) -> NetrcAuthPolicy:
+        """Resolve the policy that applies to a request and its redirects.
+
+        An explicit request-level policy wins. Otherwise the session-level
+        policy applies when one was configured. When neither was set, the
+        historical ``trust_env`` behavior is preserved so existing code keeps
+        working: an enabled environment yields the permissive default policy,
+        a disabled environment yields the deny-all policy.
+        """
+        if not isinstance(request_policy, _Unset):
+            return _coerce_netrc_auth_policy(request_policy)
+
+        session_policy = getattr(self, "netrc_auth_policy", None)
+        if session_policy is not None:
+            return session_policy
+
+        if getattr(self, "trust_env", True):
+            return NetrcAuthPolicy()
+        return NETRC_AUTH_DISABLED
+
+    def _get_netrc_auth(
+        self, prepared_request: PreparedRequest
+    ) -> tuple[str, str] | None:
+        """Return netrc credentials for a prepared request, if admitted.
+
+        The admission policy is evaluated before any credential lookup, so a
+        denied origin never triggers a netrc file read. Results are memoized
+        per URL because the final request of a redirect chain may be rebuilt
+        more than once (the ``_next`` precomputation repeats the work), and a
+        denied origin must not pay for repeated lookups or file opens.
+        """
+        assert _is_prepared(prepared_request)
+        policy = getattr(prepared_request, "_netrc_auth_policy", None)
+        if policy is None:
+            policy = self._resolve_netrc_auth_policy(UNSET)
+            prepared_request._netrc_auth_policy = policy
+
+        cache = getattr(prepared_request, "_netrc_auth_cache", None)
+        if cache is None:
+            cache = {}
+            prepared_request._netrc_auth_cache = cache
+        url = prepared_request.url
+        if url not in cache:
+            # Evaluate the policy first; a denied origin never opens netrc.
+            cache[url] = get_netrc_auth(url) if policy(url) else None
+        return cache[url]
 
     def rebuild_proxies(
         self,
@@ -421,6 +544,7 @@ class Session(SessionRedirectMixin):
     cert: _t.CertType
     max_redirects: int
     trust_env: bool
+    netrc_auth_policy: NetrcAuthPolicy | None
     cookies: RequestsCookieJar
     adapters: MutableMapping[str, BaseAdapter]
 
@@ -436,6 +560,7 @@ class Session(SessionRedirectMixin):
         "adapters",
         "stream",
         "trust_env",
+        "netrc_auth_policy",
         "max_redirects",
     ]
 
@@ -491,6 +616,15 @@ class Session(SessionRedirectMixin):
         #: authentication and similar.
         self.trust_env = True
 
+        #: Admission policy controlling which request origins may automatically
+        #: receive credentials from the user's netrc file. ``None`` (the
+        #: default) keeps the historical behavior where ``trust_env`` gates
+        #: netrc lookups. Assign a :class:`NetrcAuthPolicy` to make netrc
+        #: admission independent of proxy and CA bundle environment settings.
+        #: Use :data:`NETRC_AUTH_DISABLED` to disable automatic netrc
+        #: credentials entirely.
+        self.netrc_auth_policy: NetrcAuthPolicy | None = None
+
         #: A CookieJar containing all currently outstanding cookies set on this
         #: session. By default it is a
         #: :class:`RequestsCookieJar <requests.cookies.RequestsCookieJar>`, but
@@ -533,9 +667,17 @@ class Session(SessionRedirectMixin):
         )
 
         # Set environment's basic authentication if not explicitly set.
+        # An explicit falsy value (e.g. an empty tuple) still counts as "set":
+        # only ``None`` means "no authentication was supplied", so it must not
+        # be mistaken for a missing default.
         auth = request.auth
-        if self.trust_env and not auth and not self.auth:
-            auth = get_netrc_auth(url)
+        netrc_policy = self._resolve_netrc_auth_policy(
+            getattr(request, "netrc_auth_policy", UNSET)
+        )
+        netrc_url = cast("str", url)
+        if auth is None and self.auth is None and netrc_policy(netrc_url):
+            # The policy is checked first; a denied origin never opens netrc.
+            auth = get_netrc_auth(netrc_url)
 
         p = PreparedRequest()
         p.prepare(
@@ -552,6 +694,9 @@ class Session(SessionRedirectMixin):
             cookies=merged_cookies,
             hooks=merge_hooks(request.hooks, self.hooks),
         )
+        # Carry the resolved policy so redirects rebuild credentials through
+        # the same admission decision.
+        p._netrc_auth_policy = netrc_policy
         return p
 
     def request(
@@ -572,6 +717,7 @@ class Session(SessionRedirectMixin):
         verify: _t.VerifyType | None = None,
         cert: _t.CertType = None,
         json: _t.JsonType = None,
+        netrc_auth_policy: _t.NetrcAuthPolicyType = UNSET,
     ) -> Response:
         """Constructs a :class:`Request <Request>`, prepares it and sends it.
         Returns :class:`Response <Response>` object.
@@ -614,6 +760,13 @@ class Session(SessionRedirectMixin):
             may be useful during local development or testing.
         :param cert: (optional) if String, path to ssl client cert file (.pem).
             If Tuple, ('cert', 'key') pair.
+        :param netrc_auth_policy: (optional) Per-request override of the
+            :attr:`netrc_auth_policy` admission policy. A
+            :class:`NetrcAuthPolicy` instance is used directly; ``True`` or
+            ``None`` allow automatic netrc credentials from any origin, and
+            ``False`` disables them for this request. This only affects netrc
+            credential lookup, never proxy or CA bundle settings, and never
+            overrides an explicit ``auth`` argument.
         :rtype: requests.Response
         """
         if isinstance(url, bytes):
@@ -631,6 +784,7 @@ class Session(SessionRedirectMixin):
             auth=auth,
             cookies=cookies,
             hooks=hooks,
+            netrc_auth_policy=netrc_auth_policy,
         )
         prep = self.prepare_request(req)
 

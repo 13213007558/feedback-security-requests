@@ -182,14 +182,25 @@ from .exceptions import (
     URLRequired,
 )
 from .models import PreparedRequest, Request, Response
-from .sessions import Session, session
+from .sessions import (
+    NETRC_AUTH_DISABLED,
+    AllowedHostsNetrcAuth,
+    DenyAllNetrcAuth,
+    NetrcAuthPolicy,
+    Session,
+    session,
+)
 from .status_codes import codes
 
 __all__ = (
+    "AllowedHostsNetrcAuth",
     "ConnectionError",
     "ConnectTimeout",
+    "DenyAllNetrcAuth",
     "HTTPError",
     "JSONDecodeError",
+    "NETRC_AUTH_DISABLED",
+    "NetrcAuthPolicy",
     "PreparedRequest",
     "ReadTimeout",
     "Request",

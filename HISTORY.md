@@ -4,7 +4,20 @@ Release History
 dev
 ---
 
-- \[Short description of non-trivial change.\]
+**Features**
+- Added `Session.netrc_auth_policy` and the per-request
+  `netrc_auth_policy` argument to control which request origins may
+  automatically receive credentials from the netrc file, independently of
+  `trust_env`. Proxy and CA bundle environment settings keep following
+  `trust_env`, while netrc admission is now decided per origin by a
+  `NetrcAuthPolicy` (`AllowedHostsNetrcAuth`, `NETRC_AUTH_DISABLED`, or a
+  custom subclass). Denied origins never open the netrc file, and explicit
+  `auth` continues to take precedence.
+
+**Bugfixes**
+- An explicitly falsy `auth` value (such as an empty tuple) is no longer
+  mistaken for a missing default when deciding whether netrc credentials
+  apply.
 
 
 2.34.2 (2026-05-14)

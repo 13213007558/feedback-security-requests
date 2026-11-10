@@ -46,6 +46,17 @@ Request Sessions
 .. autoclass:: Session
    :inherited-members:
 
+.. autoclass:: requests.sessions.NetrcAuthPolicy
+   :inherited-members:
+
+.. autoclass:: requests.sessions.DenyAllNetrcAuth
+   :inherited-members:
+
+.. autoclass:: requests.sessions.AllowedHostsNetrcAuth
+   :inherited-members:
+
+.. autodata:: requests.NETRC_AUTH_DISABLED
+
 
 Lower-Level Classes
 -------------------

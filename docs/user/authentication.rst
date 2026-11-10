@@ -55,6 +55,53 @@ Requests session::
     >>> s.trust_env = False
     >>> s.get('https://httpbin.org/basic-auth/user/pass')
 
+Netrc Admission Policy
+~~~~~~~~~~~~~~~~~~~~~~
+
+Setting ``trust_env`` to ``False`` disables *every* environment integration at
+once: netrc credentials, proxy configuration and CA bundle selection. To keep
+using the proxy and CA settings from the environment while controlling which
+origins may receive netrc credentials, assign a
+:class:`~requests.sessions.NetrcAuthPolicy` to
+:attr:`Session.netrc_auth_policy <requests.Session.netrc_auth_policy>`. The
+policy is independent of ``trust_env`` and is consulted for the initial request
+and for every request rebuilt while following redirects.
+
+Allow automatic netrc credentials only for specific hosts; every other origin
+is denied without the netrc file ever being opened::
+
+    >>> s = requests.Session()
+    >>> s.netrc_auth_policy = requests.AllowedHostsNetrcAuth(['api.example.com'])
+
+Disable automatic netrc credentials entirely while still honoring proxy and CA
+environment variables::
+
+    >>> s.netrc_auth_policy = requests.NETRC_AUTH_DISABLED
+
+For custom rules, subclass :class:`~requests.sessions.NetrcAuthPolicy` and
+implement ``is_allowed(url)``, which returns ``True`` for admitted origins.
+
+A single request can override the session policy through the
+``netrc_auth_policy`` argument. A policy object is used directly, ``False``
+disables netrc credentials for that request, and ``True`` allows them from any
+origin::
+
+    >>> s.get('https://api.example.com/data', netrc_auth_policy=False)
+
+Precedence and override rules:
+
+- An explicit ``auth`` argument, or a non-``None`` ``Session.auth``, always
+  wins. Environment netrc credentials are only considered when no explicit
+  authentication was supplied and can never override it.
+- A request-level ``netrc_auth_policy`` takes precedence over the
+  session-level ``Session.netrc_auth_policy``.
+- When neither policy is set, the historical behavior is preserved:
+  ``trust_env=True`` allows netrc lookups from any origin and
+  ``trust_env=False`` disables them.
+- Only ``None`` means "no authentication supplied". An explicitly falsy value
+  such as an empty tuple is still treated as a deliberate choice not to
+  authenticate, not as a missing default.
+
 Digest Authentication
 ---------------------
 

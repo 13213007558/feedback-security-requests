@@ -2667,6 +2667,33 @@ def test_requests_are_updated_each_time(httpbin):
         assert session.calls[-1] == send_call
 
 
+def test_redirect_session_trust_env_false_skips_netrc(monkeypatch):
+    # Backward compatibility: a mixin session that only sets trust_env=False
+    # (as RedirectSession does) must resolve to the deny-all policy and must
+    # never trigger a netrc lookup while rebuilding redirect auth.
+    session = RedirectSession([302, 302])
+    assert session.trust_env is False
+    assert getattr(session, "netrc_auth_policy", None) is None
+
+    looked_up = []
+    monkeypatch.setattr(
+        requests.sessions,
+        "get_netrc_auth",
+        lambda url: looked_up.append(url),
+    )
+
+    prep = requests.Request("GET", "http://example.com/start").prepare()
+    response = session.send(prep)
+    redirected = list(session.resolve_redirects(response, prep))
+
+    assert looked_up == []
+    assert redirected
+    assert all(
+        response.request._netrc_auth_policy is requests.sessions.NETRC_AUTH_DISABLED
+        for response in redirected
+    )
+
+
 @pytest.mark.parametrize(
     "var,url,proxy",
     [

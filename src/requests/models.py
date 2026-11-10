@@ -36,7 +36,7 @@ from urllib3.filepost import encode_multipart_formdata
 from urllib3.util import parse_url
 
 from . import _types as _t
-from ._internal_utils import to_native_string, unicode_is_ascii
+from ._internal_utils import UNSET, to_native_string, unicode_is_ascii
 from .auth import HTTPBasicAuth
 from .compat import (
     JSONDecodeError,
@@ -300,6 +300,8 @@ class Request(RequestHooksMixin):
     :param auth: Auth handler or (user, pass) tuple.
     :param cookies: dictionary or CookieJar of cookies to attach to this request.
     :param hooks: dictionary of callback hooks, for internal usage.
+    :param netrc_auth_policy: admission policy for automatic netrc
+        credentials, or ``UNSET`` to defer to the :class:`Session`.
 
     Usage::
 
@@ -319,6 +321,7 @@ class Request(RequestHooksMixin):
     params: _t.ParamsType
     auth: _t.AuthType
     cookies: RequestsCookieJar | CookieJar | dict[str, str] | None
+    netrc_auth_policy: Any
 
     def __init__(
         self,
@@ -332,6 +335,7 @@ class Request(RequestHooksMixin):
         cookies: RequestsCookieJar | CookieJar | dict[str, str] | None = None,
         hooks: _t.HooksInputType | None = None,
         json: _t.JsonType = None,
+        netrc_auth_policy: Any = UNSET,
     ) -> None:
         # Default empty dicts for dict params.
         data = [] if data is None else data
@@ -353,6 +357,7 @@ class Request(RequestHooksMixin):
         self.params = params
         self.auth = auth
         self.cookies = cookies
+        self.netrc_auth_policy = netrc_auth_policy
 
     def __repr__(self) -> str:
         return f"<Request [{self.method}]>"
@@ -403,6 +408,8 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
     body: _t.BodyType
     hooks: dict[str, list[_t.HookType]]
     _body_position: int | object | None
+    _netrc_auth_policy: Any
+    _netrc_auth_cache: dict[str, tuple[str, str] | None] | None
 
     def __init__(self) -> None:
         #: HTTP verb to send to the server.
@@ -420,6 +427,12 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
         self.hooks = default_hooks()
         #: integer denoting starting position of a readable file-like body.
         self._body_position = None
+        #: admission policy applied when netrc credentials are looked up,
+        #: including while following redirects.
+        self._netrc_auth_policy = None
+        #: memoized netrc lookup results keyed by URL, shared across the
+        #: repeated auth rebuilds of a redirect chain.
+        self._netrc_auth_cache = None
 
     def prepare(
         self,
@@ -462,6 +475,8 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
         p.body = self.body
         p.hooks = self.hooks
         p._body_position = self._body_position
+        p._netrc_auth_policy = self._netrc_auth_policy
+        p._netrc_auth_cache = self._netrc_auth_cache
         return p
 
     def prepare_method(self, method: str | None) -> None:
