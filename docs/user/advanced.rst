@@ -667,6 +667,84 @@ You override this default certificate bundle by setting the ``REQUESTS_CA_BUNDLE
     >>> import requests
     >>> requests.get('https://example.org')
 
+Strict ``NO_PROXY`` matching
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The historical ``NO_PROXY`` matcher is lenient and, depending on the
+platform, can treat a bare entry such as ``example.test`` as a suffix. In
+that case a rule meant to bypass only ``example.test`` also bypasses hosts
+like ``www.example.test``, sending them directly instead of through the
+proxy. Requests therefore ships an opt-in **strict matcher**. It is disabled
+by default, so existing configurations keep their current routing until you
+deliberately migrate.
+
+Enable it in one of three ways, checked in this order:
+
+1. Per request, with the ``strict_no_proxy`` keyword::
+
+       requests.get('http://www.example.test', strict_no_proxy=True)
+
+2. For every request on a session, with the ``Session.strict_no_proxy``
+   attribute::
+
+       session = requests.Session()
+       session.strict_no_proxy = True
+
+3. Process-wide, with the ``REQUESTS_STRICT_NO_PROXY`` environment variable
+   set to a truthy value (``1``, ``true``, ``yes`` or ``on``).
+
+Strict rules have explicit meaning:
+
+* ``example.test`` matches that exact host only. It never matches
+  ``www.example.test`` or a look-alike such as ``evilexample.test``.
+* ``.example.test`` (a leading dot) matches the domain **and** every
+  sub-domain. Use this when the old suffix behavior was intended.
+* A port pins the rule: ``example.test:8080`` matches only that host on that
+  port. A rule without a port matches the scheme's default port only (80 for
+  ``http``, 443 for ``https``), so ``http://example.test:8080`` is proxied.
+* IP literals and CIDR ranges only match literal IPs in the URL. IPv6
+  literals are written with square brackets (``[::1]``, ``[2001:db8::/32]``)
+  and no DNS lookup is ever performed for matching.
+* The wildcard ``*`` bypasses the proxy for every host.
+
+Malformed entries are not silently ignored. They raise
+:class:`requests.exceptions.InvalidProxyConfig` (specifically
+``InvalidNoProxyRule``) carrying the offending entry and its zero-based
+position in the comma separated list, so the misconfiguration can be fixed
+at the source.
+
+Comparing routing before migrating
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Because the two modes can choose different proxies, Requests provides a
+comparison entry point that performs **no network activity** and never
+resolves DNS::
+
+    from requests.utils import compare_proxy_selection
+
+    report = compare_proxy_selection('http://www.example.test/')
+    report.differs          # True when the choice changes
+    report.legacy.proxy     # proxy chosen by the historical matcher
+    report.strict.proxy     # proxy chosen by the strict matcher
+    report.strict.matched_rule  # the NO_PROXY rule that forced a bypass
+
+A ``Session`` offers the same view while taking its own proxies into
+account with ``Session.compare_proxy_selection``. Proxy passwords in the
+report are replaced with ``***``, so the output is safe to log.
+
+Configuration changes to plan for
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Run the comparison over the hosts your application reaches and rewrite the
+entries whose routing changes:
+
+* Any bare entry whose sub-domains should *also* be bypassed gains a leading
+  dot (``example.test`` -> ``.example.test``).
+* Entries that rely on matching a non-default port need an explicit port.
+* Entries written as unbracketed IPv6 must be wrapped in square brackets.
+* Invalid entries that were previously tolerated now raise an error and must
+  be corrected or removed.
+
 .. _socks:
 
 SOCKS

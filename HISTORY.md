@@ -4,7 +4,15 @@ Release History
 dev
 ---
 
-- \[Short description of non-trivial change.\]
+- Added an opt-in strict ``NO_PROXY`` matcher (``Session.strict_no_proxy``,
+  the per-request ``strict_no_proxy`` keyword, or the
+  ``REQUESTS_STRICT_NO_PROXY`` environment variable). Strict rules honor host
+  and domain boundaries, explicit ports, bracketed IPv6 literals and CIDR
+  ranges, only match literal IPs without DNS lookups, and raise a locatable
+  ``InvalidProxyConfig`` for malformed entries. The historical matcher is
+  unchanged; ``requests.utils.compare_proxy_selection`` reports the proxy and
+  matched rule chosen by each mode (with proxy passwords redacted) to support
+  migration.
 
 
 2.34.2 (2026-05-14)

@@ -127,6 +127,15 @@ class InvalidProxyURL(InvalidURL):
     """The proxy URL provided is invalid."""
 
 
+class InvalidProxyConfig(RequestException, ValueError):
+    """Proxy configuration (for example a strict ``NO_PROXY`` rule) is
+    invalid.
+
+    Subclasses expose enough context (the offending entry and its position)
+    for callers to locate and fix the misconfiguration.
+    """
+
+
 class ChunkedEncodingError(RequestException):
     """The server declared chunked encoding but sent an invalid chunk."""
 

@@ -21,6 +21,7 @@ import warnings
 import zipfile
 from collections import OrderedDict
 from collections.abc import Generator, Iterable
+from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -32,6 +33,7 @@ from typing import (
 
 from urllib3.util import make_headers, parse_url
 
+from . import _no_proxy as _np
 from . import certs
 from .__version__ import __version__
 
@@ -807,7 +809,42 @@ def set_environ(env_name: str, value: str | None) -> Generator[None, None, None]
                 os.environ[env_name] = old_value
 
 
-def should_bypass_proxies(url: str, no_proxy: str | None) -> bool:
+def should_bypass_proxies(url: str, no_proxy: str | None, strict: bool = False) -> bool:
+    """
+    Returns whether we should bypass proxies or not.
+
+    When ``strict`` is ``False`` (the default) the historical, lenient
+    matching is preserved. Opting into ``strict`` uses the boundary-aware
+    matcher from :mod:`requests._no_proxy`, which validates every rule and
+    raises :class:`requests.exceptions.InvalidProxyConfig` for malformed
+    entries.
+
+    :rtype: bool
+    """
+    if strict:
+        return _strict_should_bypass(url, no_proxy)
+    return _should_bypass_proxies_legacy(url, no_proxy)
+
+
+def _strict_bypass(url: str, no_proxy: str | None) -> _np.NoProxyMatch | None:
+    if no_proxy is None:
+        no_proxy = _np.env_no_proxy()
+    parsed = urlparse(url)
+    if parsed.hostname is None:
+        # URLs without a host (e.g. file:///) always go direct, but no
+        # concrete NO_PROXY rule can be named for them.
+        return None
+    return _np.should_bypass_proxies_strict(url, no_proxy)
+
+
+def _strict_should_bypass(url: str, no_proxy: str | None) -> bool:
+    """Strict bypass predicate, preserving the hostless-URL shortcut."""
+    if urlparse(url).hostname is None:
+        return True
+    return _strict_bypass(url, no_proxy) is not None
+
+
+def _should_bypass_proxies_legacy(url: str, no_proxy: str | None) -> bool:
     """
     Returns whether we should bypass proxies or not.
 
@@ -870,13 +907,15 @@ def should_bypass_proxies(url: str, no_proxy: str | None) -> bool:
     return False
 
 
-def get_environ_proxies(url: str, no_proxy: str | None = None) -> dict[str, str]:
+def get_environ_proxies(
+    url: str, no_proxy: str | None = None, strict: bool = False
+) -> dict[str, str]:
     """
     Return a dict of environment proxies.
 
     :rtype: dict
     """
-    if should_bypass_proxies(url, no_proxy=no_proxy):
+    if should_bypass_proxies(url, no_proxy=no_proxy, strict=strict):
         return {}
     else:
         return getproxies()
@@ -908,18 +947,176 @@ def select_proxy(url: str, proxies: dict[str, str] | None) -> str | None:
     return proxy
 
 
+@dataclass(frozen=True)
+class ProxySelection:
+    """The proxy chosen for one URL under one matching mode.
+
+    ``proxy`` is the selected proxy URL with any password redacted, or
+    ``None`` for a direct connection. ``matched_rule`` is the canonical text
+    of the ``NO_PROXY`` rule that forced the bypass (or ``None`` when no rule
+    matched); ``bypassed`` reports whether such a rule matched, independently
+    of any host-specific proxy that may still apply.
+    """
+
+    proxy: str | None
+    matched_rule: str | None
+    bypassed: bool
+
+
+@dataclass(frozen=True)
+class ProxyComparison:
+    """Side-by-side routing for the legacy and strict matchers.
+
+    Use :attr:`differs` to detect URLs whose routing changes after enabling
+    strict mode and inspect ``legacy`` / ``strict`` for the details.
+    """
+
+    url: str
+    legacy: ProxySelection
+    strict: ProxySelection
+
+    @property
+    def differs(self) -> bool:
+        return (
+            self.legacy.proxy != self.strict.proxy
+            or self.legacy.bypassed != self.strict.bypassed
+        )
+
+
+def sanitize_proxy_url(proxy: str | None) -> str | None:
+    """Return ``proxy`` with any password replaced by ``***``.
+
+    Usernames and host information are preserved so reports stay useful for
+    debugging without leaking credentials.
+    """
+    if proxy is None:
+        return None
+    parsed = urlparse(proxy)
+    if parsed.password is None:
+        return proxy
+    username = parsed.username or ""
+    host = parsed.hostname or ""
+    port = f":{parsed.port}" if parsed.port else ""
+    auth = f"{username}:***@" if username else "***@"
+    suffix = f"?{parsed.query}" if parsed.query else ""
+    return f"{parsed.scheme}://{auth}{host}{port}{parsed.path}{suffix}"
+
+
+def _legacy_matched_rule(url: str, no_proxy: str | None) -> str | None:
+    """Mirror the legacy no_proxy list check to name the matched entry.
+
+    Only the explicit ``NO_PROXY`` list is inspected; an OS-level
+    ``proxy_bypass`` match cannot be attributed to a concrete entry and is
+    reported as ``None``.
+    """
+    if no_proxy is None:
+        no_proxy = _np.env_no_proxy()
+    if not no_proxy:
+        return None
+    parsed = urlparse(url)
+    hostname = parsed.hostname
+    if hostname is None:
+        return None
+    host_with_port = hostname
+    if parsed.port:
+        host_with_port += f":{parsed.port}"
+    for entry in no_proxy.replace(" ", "").split(","):
+        if not entry:
+            continue
+        host = entry.lstrip(".")
+        if hostname == host or host_with_port == host:
+            return entry
+        dotted = "." + host
+        if hostname.endswith(dotted) or host_with_port.endswith(dotted):
+            return entry
+        if is_valid_cidr(entry) and is_ipv4_address(hostname):
+            if address_in_network(hostname, entry):
+                return entry
+        elif is_ipv4_address(hostname) and hostname == entry:
+            return entry
+    return None
+
+
+def compare_proxy_selection(
+    url: str,
+    proxies: dict[str, str] | None = None,
+    no_proxy: str | None = None,
+    trust_env: bool = True,
+) -> ProxyComparison:
+    """Resolve the proxy for ``url`` under both matching modes.
+
+    This performs no network activity and never triggers DNS resolution. It
+    runs the historical matcher (``strict=False``) and the opt-in strict
+    matcher against the same configuration and returns both choices plus the
+    rules that caused a bypass. Passwords in proxy URLs are redacted.
+
+    :param url: The URL that would be requested.
+    :param proxies: Proxy mapping as accepted by ``Session``/requests.
+    :param no_proxy: Explicit ``NO_PROXY`` value; falls back to the
+        environment when ``None``.
+    :param trust_env: Whether environment proxy variables are considered.
+    """
+    proxies = dict(proxies or {})
+    if no_proxy is not None:
+        proxies["no_proxy"] = no_proxy
+
+    # Imported lazily: models imports from utils and would create a cycle at
+    # module load time.
+    from .models import PreparedRequest
+
+    carrier = PreparedRequest()
+    carrier.prepare(method="GET", url=url)
+
+    legacy_resolved = resolve_proxies(
+        carrier, proxies, trust_env=trust_env, strict=False
+    )
+    strict_resolved = resolve_proxies(
+        carrier, proxies, trust_env=trust_env, strict=True
+    )
+
+    legacy_proxy = select_proxy(url, legacy_resolved)
+    strict_proxy = select_proxy(url, strict_resolved)
+
+    legacy_bypass = should_bypass_proxies(url, no_proxy, strict=False)
+    legacy_rule = _legacy_matched_rule(url, no_proxy) if legacy_bypass else None
+    # Parse strict rules independently of trust_env so the report always names
+    # the matched rule and invalid configurations surface here as well.
+    strict_match = _strict_bypass(url, no_proxy)
+    strict_bypass = _strict_should_bypass(url, no_proxy)
+
+    return ProxyComparison(
+        url=url,
+        legacy=ProxySelection(
+            proxy=sanitize_proxy_url(legacy_proxy),
+            matched_rule=legacy_rule,
+            bypassed=legacy_bypass,
+        ),
+        strict=ProxySelection(
+            proxy=sanitize_proxy_url(strict_proxy),
+            matched_rule=strict_match.matched if strict_match else None,
+            bypassed=strict_bypass,
+        ),
+    )
+
+
 def resolve_proxies(
     request: Request | PreparedRequest,
     proxies: dict[str, str] | None,
     trust_env: bool = True,
+    strict: bool = False,
 ) -> dict[str, str]:
     """This method takes proxy information from a request and configuration
     input to resolve a mapping of target proxies. This will consider settings
     such as NO_PROXY to strip proxy configurations.
 
+    When ``strict`` is true the validated strict matcher decides the bypass
+    and, on a bypass, only host-specific proxy entries are retained instead
+    of leaving scheme-level proxies pointing at the bypassed host.
+
     :param request: Request or PreparedRequest
     :param proxies: A dictionary of schemes or schemes and hosts to proxy URLs
     :param trust_env: Boolean declaring whether to trust environment configs
+    :param strict: Use the opt-in strict NO_PROXY matcher.
 
     :rtype: dict
     """
@@ -929,6 +1126,15 @@ def resolve_proxies(
     no_proxy = proxies.get("no_proxy")
     new_proxies = proxies.copy()
 
+    if strict:
+        if trust_env and _strict_should_bypass(url, no_proxy):
+            return _retain_host_specific_proxies(new_proxies)
+        if trust_env:
+            environ_proxies = get_environ_proxies(url, no_proxy=no_proxy, strict=True)
+            proxy = environ_proxies.get(scheme, environ_proxies.get("all"))
+            if proxy:
+                new_proxies.setdefault(scheme, proxy)
+        return new_proxies
     if trust_env and not should_bypass_proxies(url, no_proxy=no_proxy):
         environ_proxies = get_environ_proxies(url, no_proxy=no_proxy)
 
@@ -937,6 +1143,23 @@ def resolve_proxies(
         if proxy:
             new_proxies.setdefault(scheme, proxy)
     return new_proxies
+
+
+def _retain_host_specific_proxies(
+    proxies: dict[str, str],
+) -> dict[str, str]:
+    """Drop scheme-level (``http``/``all`` ...) proxies on a strict bypass.
+
+    Entries keyed with an explicit host (``scheme://host``) still apply, so
+    a deliberately configured per-host proxy is never silently discarded.
+    Configuration markers that do not select a proxy (``no_proxy`` and the
+    platform-specific ``no`` alias produced by ``getproxies``) are dropped.
+    """
+    return {
+        key: value
+        for key, value in proxies.items()
+        if "://" in key and key not in ("no_proxy", "no")
+    }
 
 
 def default_user_agent(name: str = "python-requests") -> str:

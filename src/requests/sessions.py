@@ -47,6 +47,7 @@ from .status_codes import codes
 from .structures import CaseInsensitiveDict
 from .utils import (  # noqa: F401
     DEFAULT_PORTS,
+    compare_proxy_selection,
     default_headers,
     get_auth_from_url,
     get_environ_proxies,
@@ -71,6 +72,16 @@ if sys.platform == "win32":
     preferred_clock = time.perf_counter
 else:
     preferred_clock = time.time
+
+
+def _strict_no_proxy_env() -> bool:
+    """Read the ``REQUESTS_STRICT_NO_PROXY`` opt-in environment switch.
+
+    Truthy values (``1``/``true``/``yes``/``on``) enable strict matching;
+    anything else leaves the historical behavior in place.
+    """
+    value = os.environ.get("REQUESTS_STRICT_NO_PROXY", "")
+    return value.strip().lower() in ("1", "true", "yes", "on")
 
 
 def merge_setting(
@@ -127,6 +138,7 @@ def merge_hooks(
 class SessionRedirectMixin:
     max_redirects: int
     trust_env: bool
+    strict_no_proxy: bool
     cookies: RequestsCookieJar
 
     def send(self, request: PreparedRequest, **kwargs: Any) -> Response: ...
@@ -193,6 +205,7 @@ class SessionRedirectMixin:
         cert: _t.CertType = None,
         proxies: dict[str, str] | None = None,
         yield_requests: bool = False,
+        strict_no_proxy: bool | None = None,
         **adapter_kwargs: Any,
     ) -> Generator[Response, None, None]:
         """Receives a Response. Returns a generator of Responses or Requests."""
@@ -269,7 +282,9 @@ class SessionRedirectMixin:
             prepared_request.prepare_cookies(cookie_jar)
 
             # Rebuild auth and proxy information.
-            proxies = self.rebuild_proxies(prepared_request, proxies)
+            proxies = self.rebuild_proxies(
+                prepared_request, proxies, strict_no_proxy=strict_no_proxy
+            )
             self.rebuild_auth(prepared_request, resp)
 
             # A failed tell() sets `_body_position` to `object()`. This non-None
@@ -335,12 +350,17 @@ class SessionRedirectMixin:
         self,
         prepared_request: PreparedRequest,
         proxies: dict[str, str] | None,
+        strict_no_proxy: bool | None = None,
     ) -> dict[str, str]:
         """This method re-evaluates the proxy configuration by considering the
         environment variables. If we are redirected to a URL covered by
         NO_PROXY, we strip the proxy configuration. Otherwise, we set missing
         proxy keys for this URL (in case they were stripped by a previous
         redirect).
+
+        When ``strict_no_proxy`` is set, the validated strict matcher is used
+        so a cross-origin redirect re-selects the proxy with the same rules
+        as the original request.
 
         This method also replaces the Proxy-Authorization header where
         necessary.
@@ -350,7 +370,14 @@ class SessionRedirectMixin:
         assert _is_prepared(prepared_request)
         headers = prepared_request.headers
         scheme = urlparse(prepared_request.url).scheme
-        new_proxies = resolve_proxies(prepared_request, proxies, self.trust_env)
+        if strict_no_proxy is None:
+            strict_no_proxy = self.strict_no_proxy or _strict_no_proxy_env()
+        new_proxies = resolve_proxies(
+            prepared_request,
+            proxies,
+            self.trust_env,
+            strict=strict_no_proxy,
+        )
 
         if "Proxy-Authorization" in headers:
             del headers["Proxy-Authorization"]
@@ -491,6 +518,13 @@ class Session(SessionRedirectMixin):
         #: authentication and similar.
         self.trust_env = True
 
+        #: Opt into the strict, boundary-aware ``NO_PROXY`` matcher. When
+        #: ``False`` (default) the historical lenient matching is preserved.
+        #: A per-request ``strict_no_proxy`` keyword and the
+        #: ``REQUESTS_STRICT_NO_PROXY`` environment variable take precedence
+        #: over this attribute.
+        self.strict_no_proxy = False
+
         #: A CookieJar containing all currently outstanding cookies set on this
         #: session. By default it is a
         #: :class:`RequestsCookieJar <requests.cookies.RequestsCookieJar>`, but
@@ -572,6 +606,7 @@ class Session(SessionRedirectMixin):
         verify: _t.VerifyType | None = None,
         cert: _t.CertType = None,
         json: _t.JsonType = None,
+        strict_no_proxy: bool | None = None,
     ) -> Response:
         """Constructs a :class:`Request <Request>`, prepares it and sends it.
         Returns :class:`Response <Response>` object.
@@ -638,14 +673,20 @@ class Session(SessionRedirectMixin):
 
         proxies = proxies or {}
 
+        # Resolution order, highest to lowest: request keyword, session
+        # attribute, REQUESTS_STRICT_NO_PROXY environment variable.
+        if strict_no_proxy is None:
+            strict_no_proxy = self.strict_no_proxy or _strict_no_proxy_env()
+
         settings = self.merge_environment_settings(
-            prep.url, proxies, stream, verify, cert
+            prep.url, proxies, stream, verify, cert, strict=strict_no_proxy
         )
 
         # Send the request.
         send_kwargs = {
             "timeout": timeout,
             "allow_redirects": allow_redirects,
+            "strict_no_proxy": strict_no_proxy,
         }
         send_kwargs.update(settings)
         resp = self.send(prep, **send_kwargs)
@@ -759,8 +800,22 @@ class Session(SessionRedirectMixin):
         kwargs.setdefault("stream", self.stream)
         kwargs.setdefault("verify", self.verify)
         kwargs.setdefault("cert", self.cert)
+        strict_no_proxy = kwargs.pop("strict_no_proxy", None)
+        if strict_no_proxy is None:
+            strict_no_proxy = self.strict_no_proxy or _strict_no_proxy_env()
         if "proxies" not in kwargs:
-            kwargs["proxies"] = resolve_proxies(request, self.proxies, self.trust_env)
+            kwargs["proxies"] = resolve_proxies(
+                request, self.proxies, self.trust_env, strict=strict_no_proxy
+            )
+        elif strict_no_proxy:
+            # request() already merged environment/session proxies; re-run
+            # strict resolution so NO_PROXY bypasses are applied to them too.
+            kwargs["proxies"] = resolve_proxies(
+                request,
+                kwargs["proxies"],
+                self.trust_env,
+                strict=True,
+            )
 
         # It's possible that users might accidentally send a Request object.
         # Guard against that specific failure case.
@@ -801,7 +856,9 @@ class Session(SessionRedirectMixin):
         # Resolve redirects if allowed.
         if allow_redirects:
             # Redirect resolving generator.
-            gen = self.resolve_redirects(r, request, **kwargs)
+            gen = self.resolve_redirects(
+                r, request, strict_no_proxy=strict_no_proxy, **kwargs
+            )
             history = [resp for resp in gen]
         else:
             history = []
@@ -818,7 +875,13 @@ class Session(SessionRedirectMixin):
         if not allow_redirects:
             try:
                 r._next = next(  # type: ignore[assignment]  # yield_requests=True returns PreparedRequest
-                    self.resolve_redirects(r, request, yield_requests=True, **kwargs)
+                    self.resolve_redirects(
+                        r,
+                        request,
+                        yield_requests=True,
+                        strict_no_proxy=strict_no_proxy,
+                        **kwargs,
+                    )
                 )
             except StopIteration:
                 pass
@@ -835,6 +898,7 @@ class Session(SessionRedirectMixin):
         stream: bool | None,
         verify: _t.VerifyType | None,
         cert: _t.CertType,
+        strict: bool = False,
     ) -> dict[str, Any]:
         """
         Check the environment and merge it with some settings.
@@ -845,7 +909,7 @@ class Session(SessionRedirectMixin):
         if self.trust_env:
             # Set environment's proxies.
             no_proxy = proxies.get("no_proxy") if proxies is not None else None
-            env_proxies = get_environ_proxies(url, no_proxy=no_proxy)
+            env_proxies = get_environ_proxies(url, no_proxy=no_proxy, strict=strict)
             if proxies is not None:
                 for k, v in env_proxies.items():
                     proxies.setdefault(k, v)
@@ -866,6 +930,30 @@ class Session(SessionRedirectMixin):
         cert = merge_setting(cert, self.cert)
 
         return {"proxies": proxies, "stream": stream, "verify": verify, "cert": cert}
+
+    def compare_proxy_selection(
+        self,
+        url: str,
+        proxies: dict[str, str] | None = None,
+        no_proxy: str | None = None,
+    ):
+        """Show which proxy this session picks for ``url`` under both
+        matching modes, without sending any request.
+
+        The session's :attr:`proxies` and :attr:`trust_env` are taken into
+        account, and the returned report hides proxy passwords. Use
+        ``.differs`` on the result to find URLs whose routing changes once
+        strict ``NO_PROXY`` matching is enabled.
+
+        :rtype: requests.utils.ProxyComparison
+        """
+        merged = merge_setting(self.proxies, proxies)
+        return compare_proxy_selection(
+            url,
+            proxies=merged,
+            no_proxy=no_proxy,
+            trust_env=self.trust_env,
+        )
 
     def get_adapter(self, url: str) -> BaseAdapter:
         """
