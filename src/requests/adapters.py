@@ -154,6 +154,33 @@ class BaseAdapter:
         """Cleans up adapter specific items."""
         raise NotImplementedError
 
+    def rebuild_for_fork(self) -> None:
+        """Rebuild transport state in a forked child process.
+
+        After a process is forked, the child must not reuse the inherited
+        transport resources: open sockets and synchronization primitives are
+        shared with the parent process, which can corrupt connection pools or
+        deadlock on locks the parent thread still holds. This method is called
+        by :meth:`requests.Session.rebuild_for_fork` (or automatically on the
+        first request after a fork is detected) and must replace the inherited
+        resources with fresh ones owned by the calling process.
+
+        Implementations must not acquire locks that may be held by the parent
+        process and must not close or shut down the inherited resources, as
+        doing so would also affect the parent process. The inherited resources
+        are simply abandoned and reclaimed independently by each process.
+
+        :raises NotImplementedError: if the adapter cannot rebuild its
+            transport safely. Custom adapters must override this method to be
+            usable across a fork.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__!r} does not implement rebuild_for_fork() and "
+            "cannot be used safely in a forked child process. Custom transport "
+            "adapters must override rebuild_for_fork() to create fresh "
+            "transport resources without reusing inherited connections or locks."
+        )
+
 
 class HTTPAdapter(BaseAdapter):
     """The built-in HTTP Adapter for urllib3.
@@ -235,6 +262,34 @@ class HTTPAdapter(BaseAdapter):
         self.init_poolmanager(
             self._pool_connections, self._pool_maxsize, block=self._pool_block
         )
+
+    def rebuild_for_fork(self) -> None:
+        """Replace pooled connections with fresh transport after a fork.
+
+        A forked child inherits the parent's pool managers, including their
+        open sockets and the locks guarding them. Reusing them is unsafe: the
+        parent process may hold one of those locks, and closing the inherited
+        sockets would tear down the parent's connections. This method therefore
+        creates brand new pool managers while preserving every connection
+        parameter (pool sizes, blocking behaviour), the retry configuration and
+        the proxy URLs already configured on the adapter.
+
+        The inherited managers are deliberately abandoned rather than shut
+        down: neither :meth:`clear` nor any other locking call is made on them,
+        so the parent process keeps full ownership of its own resources.
+        """
+        # Preserve the proxy URLs so proxy managers are recreated lazily with
+        # the same settings; the managers themselves hold inherited sockets and
+        # locks and must not be touched.
+        proxy_urls = list(self.proxy_manager.keys())
+
+        self.proxy_manager = {}
+        self.config = {}
+        self.init_poolmanager(
+            self._pool_connections, self._pool_maxsize, block=self._pool_block
+        )
+
+        self.proxy_manager = {url: self.proxy_manager_for(url) for url in proxy_urls}
 
     def init_poolmanager(
         self,

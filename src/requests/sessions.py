@@ -502,6 +502,11 @@ class Session(SessionRedirectMixin):
         self.mount("https://", HTTPAdapter())
         self.mount("http://", HTTPAdapter())
 
+        # PID of the process that currently owns the transport resources. A
+        # mismatch means this session was inherited across a fork and its
+        # adapters must be rebuilt before the next request is sent.
+        self._owner_pid = os.getpid()
+
     def __enter__(self) -> Self:
         return self
 
@@ -754,6 +759,10 @@ class Session(SessionRedirectMixin):
 
         :rtype: requests.Response
         """
+        # If this session was inherited across a fork, replace the inherited
+        # transport before touching any shared connection pools or locks.
+        self._handle_fork()
+
         # Set defaults that the hooks can utilize to ensure they always have
         # the correct parameters to reproduce the previous request.
         kwargs.setdefault("stream", self.stream)
@@ -884,6 +893,33 @@ class Session(SessionRedirectMixin):
         """Closes all adapters and as such the session"""
         for v in self.adapters.values():
             v.close()
+
+    def rebuild_for_fork(self) -> None:
+        """Rebuild transport resources after this process was forked.
+
+        A :class:`Session` created in a parent process is inherited, along
+        with its connection pools and their locks, by every forked child. The
+        inherited connections and locks must not be reused: they are shared
+        with the parent process, so sending on them can corrupt pooled
+        connections or block forever on a lock the parent thread still holds.
+
+        This method gives every mounted adapter the chance to replace its
+        inherited transport resources with fresh ones while retaining the
+        session configuration (headers, cookies, proxies, retry settings and
+        similar). It is safe to call explicitly just after a fork, and is also
+        invoked automatically on the first :meth:`send` after a process change
+        is detected. The parent process keeps using its own untouched session.
+
+        Adapters that cannot rebuild safely raise an error instead of silently
+        reusing inherited state.
+        """
+        for adapter in self.adapters.values():
+            adapter.rebuild_for_fork()
+        self._owner_pid = os.getpid()
+
+    def _handle_fork(self) -> None:
+        if getattr(self, "_owner_pid", None) != os.getpid():
+            self.rebuild_for_fork()
 
     def mount(self, prefix: str, adapter: BaseAdapter) -> None:
         """Registers a connection adapter to a prefix.

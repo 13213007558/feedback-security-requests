@@ -82,6 +82,56 @@ exited, even if unhandled exceptions occurred.
 All values that are contained within a session are directly available to you.
 See the :ref:`Session API Docs <sessionapi>` to learn more.
 
+.. _post-fork-handling:
+
+Fork and Process Inheritance
+----------------------------
+
+Preforking servers create a :class:`Session` in the parent process and then
+``fork()`` worker processes that inherit it. A forked child must not reuse the
+inherited transport: the pooled HTTP connections are open sockets shared with
+the parent, and the locks guarding the pools may be held by a parent thread.
+Reusing them can corrupt pooled connections or deadlock the child.
+
+A Session tracks the process that owns its transport. On the first request
+after a process change is detected it rebuilds every mounted adapter
+automatically, so workers normally need no extra code. You can also trigger
+the rebuild explicitly with :meth:`Session.rebuild_for_fork
+<requests.Session.rebuild_for_fork>` immediately after forking.
+
+The rebuild creates brand new connection and proxy pool managers while
+keeping all of the Session configuration: connection parameters, retry
+configuration, proxy settings, headers, cookies and so on. It never acquires
+an inherited lock and never shuts down the inherited connections, so the
+parent process keeps using its own Session untouched.
+
+A minimal prefork integration::
+
+    import os
+    import requests
+
+    session = requests.Session()
+    # Parent-process setup: retries, proxies, adapters, headers, ...
+    adapter = requests.adapters.HTTPAdapter(max_retries=3)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+
+    pid = os.fork()
+    if pid == 0:
+        # Worker process: replace inherited transport before the first request.
+        # This is also done automatically; calling it here makes it explicit.
+        session.rebuild_for_fork()
+        response = session.get("https://example.com/")
+        # ... handle the request, then close only this process' resources.
+        session.close()
+        os._exit(0)
+
+Custom transport adapters must implement
+:meth:`BaseAdapter.rebuild_for_fork <requests.adapters.BaseAdapter.rebuild_for_fork>`
+to be usable across a fork. The default implementation raises
+``NotImplementedError`` with an explicit message rather than silently reusing
+inherited connections and locks.
+
 .. _request-and-response-objects:
 
 Request and Response Objects
